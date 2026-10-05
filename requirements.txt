@@ -2,3 +2,6 @@ streamlit
 supabase
 pandas
 requests
+protobuf>=4.21.0
+websockets
+pycryptodome
