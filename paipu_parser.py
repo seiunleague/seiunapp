@@ -1,6 +1,7 @@
 import re
-import json
 import requests
+import json
+from google.protobuf.internal import decoder
 
 def extract_uuid(paipu_input: str) -> str:
     """
@@ -19,7 +20,6 @@ def fetch_and_parse(paipu_input: str) -> dict:
     """
     uuid = extract_uuid(paipu_input)
     
-    # 0~3家の初期スタッツ
     stats_by_seat = {
         seat: {
             "horyo_count": 0,     # 和了回数
@@ -32,12 +32,10 @@ def fetch_and_parse(paipu_input: str) -> dict:
         for seat in range(4)
     }
 
-    # 1. 雀魂サーバーからの牌譜データ（Protobufバイナリ）取得
     pb_data = fetch_paipu_pb(uuid)
 
     if pb_data:
-        # 2. Protobuf/JSON アクションログのパース処理
-        parse_paipu_data(pb_data, stats_by_seat)
+        parse_protobuf_binary(pb_data, stats_by_seat)
 
     return stats_by_seat
 
@@ -64,49 +62,93 @@ def fetch_paipu_pb(uuid: str) -> bytes:
         return None
 
 
-def parse_paipu_data(pb_data: bytes, stats_by_seat: dict):
+def extract_strings_from_protobuf(data: bytes) -> list:
     """
-    Protobuf バイナリ / JSON アクション構造の解読処理
+    Protobuf バイナリから Length-delimited (Wire Type 2) の文字列/バイト列を再帰的に抽出する
     """
-    try:
-        # 雀魂の牌譜バイナリ内に含まれるテキスト・JSON要素を抽出・フォールバック解析
-        # ※ プロトコルバッファ構造内の名 committed action / record data 抽出
-        text_content = pb_data.decode('utf-8', errors='ignore')
-        
-        # 局ごとの和了・放銃・立直・副露イベントをバイナリ/テキストパターンから検出
-        # 1. 立直 (ActionRiichi / 立直宣言)
-        riichi_matches = re.findall(r'ActionRiichi.*?seat["\':\s]*([0-3])', text_content)
-        for seat_str in riichi_matches:
-            seat = int(seat_str)
-            if seat in stats_by_seat:
-                stats_by_seat[seat]["riichi_count"] += 1
-
-        # 2. 副露 (ActionChiPengGang / ポン・チー・カン)
-        furo_matches = re.findall(r'ActionChiPengGang.*?seat["\':\s]*([0-3])', text_content)
-        for seat_str in furo_matches:
-            seat = int(seat_str)
-            if seat in stats_by_seat:
-                stats_by_seat[seat]["furo_count"] += 1
-
-        # 3. 和了・放銃 (ActionHule)
-        # Huleブロック（和了イベント）のパース
-        hule_blocks = re.findall(r'ActionHule.*?(?=Action|\Z)', text_content, re.DOTALL)
-        for block in hule_blocks:
-            # 和了者（hule seat）
-            hule_seats = re.findall(r'seat["\':\s]*([0-3])', block)
-            # ターゲット（放銃者 target / delta点数）
-            target_seats = re.findall(r'delta.*seat["\':\s]*([0-3])', block)
+    strings = []
+    pos = 0
+    length = len(data)
+    
+    while pos < length:
+        try:
+            key, pos = decoder._DecodeVarint32(data, pos)
+            wire_type = key & 0x7
             
-            if hule_seats:
-                win_seat = int(hule_seats[0])
-                if win_seat in stats_by_seat:
-                    stats_by_seat[win_seat]["horyo_count"] += 1
+            if wire_type == 2:  # Length-delimited (String, Bytes, Embedded Message)
+                size, pos = decoder._DecodeVarint32(data, pos)
+                sub_data = data[pos:pos+size]
+                pos += size
                 
-                # 放銃者の判定（ツモ以外でロン上がりされたプレイヤー）
-                for t_str in target_seats:
-                    target_seat = int(t_str)
-                    if target_seat != win_seat and target_seat in stats_by_seat:
-                        stats_by_seat[target_seat]["hoju_count"] += 1
+                # UTF-8 テキストとしてデコード試行
+                try:
+                    text = sub_data.decode('utf-8')
+                    strings.append(text)
+                except UnicodeDecodeError:
+                    pass
+                
+                # ネストされたProtobufメッセージの再帰解析
+                strings.extend(extract_strings_from_protobuf(sub_data))
+                
+            elif wire_type == 0:  # Varint
+                _, pos = decoder._DecodeVarint32(data, pos)
+            elif wire_type == 1:  # 64-bit
+                pos += 8
+            elif wire_type == 5:  # 32-bit
+                pos += 4
+            else:
+                break
+        except Exception:
+            break
+            
+    return strings
 
-    except Exception as e:
-        print(f"パース処理中にエラーが発生しました: {e}")
+
+def parse_protobuf_binary(pb_data: bytes, stats_by_seat: dict):
+    """
+    抽出した Protobuf 文字列・JSONログからスタッツを集計する
+    """
+    extracted_strings = extract_strings_from_protobuf(pb_data)
+    
+    for text in extracted_strings:
+        # JSON 形式でアクションが含まれている場合の解析
+        if text.startswith('{') and text.endswith('}'):
+            try:
+                data = json.loads(text)
+                name = data.get("name", "")
+                data_body = data.get("data", {})
+                
+                # 1. 立直 (RecordRiichi / ActionRiichi)
+                if "Riichi" in name or "riichi" in data_body:
+                    seat = data_body.get("seat")
+                    if seat is not None and 0 <= int(seat) <= 3:
+                        stats_by_seat[int(seat)]["riichi_count"] += 1
+
+                # 2. 副露 (RecordChiPengGang / ActionChiPengGang)
+                if any(k in name for k in ["ChiPeng", "AnGang", "MingGang"]) or "type" in data_body:
+                    seat = data_body.get("seat")
+                    if seat is not None and 0 <= int(seat) <= 3:
+                        stats_by_seat[int(seat)]["furo_count"] += 1
+
+                # 3. 和了・放銃 (RecordHule / ActionHule)
+                if "Hule" in name or "hule" in data_body:
+                    hule_list = data_body.get("hule", [])
+                    if isinstance(hule_list, dict):
+                        hule_list = [hule_list]
+                        
+                    for hule in hule_list:
+                        win_seat = hule.get("seat")
+                        target_seat = hule.get("target")
+                        score = hule.get("score", 0)
+
+                        if win_seat is not None and 0 <= int(win_seat) <= 3:
+                            stats_by_seat[int(win_seat)]["horyo_count"] += 1
+                            stats_by_seat[int(win_seat)]["total_agari_pt"] += score
+
+                        # ツモ以外のロン放銃
+                        if target_seat is not None and target_seat != win_seat and 0 <= int(target_seat) <= 3:
+                            stats_by_seat[int(target_seat)]["hoju_count"] += 1
+                            stats_by_seat[int(target_seat)]["total_hoju_pt"] += score
+
+            except Exception:
+                pass
