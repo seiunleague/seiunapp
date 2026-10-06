@@ -22,18 +22,16 @@ if st.button("牌譜データを取得・解析"):
     else:
         with st.spinner("雀魂サーバーから牌譜データを解析中..."):
             try:
-                # 牌譜解析を実行 (paipu_parser.py 側の実装関数)
-                # ※ もしバイナリ直渡し等の場合は実際の関数名・引数に合わせて変更してください
-                # game_bytes = fetch_paipu_bytes(paipu_id)
-                # stats = paipu_parser.extract_game_stats(game_bytes)
-                
-                # サンプル確認用データ構造（パース後の辞書データを想定）
-                # stats = paipu_parser.get_stats(paipu_id)
+                # --------------------------------------------------
+                # 1. 牌譜データの取得 & 解析 (statsの生成)
+                # --------------------------------------------------
+                # paipu_parser 内の実装関数を呼び出して stats を取得
+                stats = paipu_parser.fetch_and_parse(paipu_id)
 
                 st.success(f"牌譜ID: {paipu_id} の解析が完了しました！")
                 
                 # --------------------------------------------------
-                # 1. 画面上に解析データのプレビューテーブルを表示
+                # 2. 画面上に解析データのプレビューテーブルを表示
                 # --------------------------------------------------
                 st.subheader("📊 解析結果プレビュー")
                 
@@ -53,7 +51,7 @@ if st.button("牌譜データを取得・解析"):
                 st.dataframe(df, use_container_width=True)
 
                 # --------------------------------------------------
-                # 2. Supabase への保存処理
+                # 3. Supabase への保存処理
                 # --------------------------------------------------
                 with st.spinner("Supabase へ保存中..."):
                     for seat, s in stats.items():
