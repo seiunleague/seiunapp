@@ -28,7 +28,7 @@ def fetch_and_parse(paipu_input: str) -> dict:
             "horyo_count": 0,     # 和了回数
             "hoju_count": 0,      # 放銃回数
             "riichi_count": 0,    # 立直回数
-            "furo_count": 0,      # 副露（ポン・チー・カン）回数
+            "furo_count": 0,      # 副露回数
             "total_agari_pt": 0,  # 獲得素点合計
             "total_hoju_pt": 0    # 放銃失点合計
         }
@@ -38,7 +38,7 @@ def fetch_and_parse(paipu_input: str) -> dict:
     pb_data = fetch_paipu_pb(uuid)
 
     if pb_data:
-        parse_paipu_binary_direct(pb_data, stats_by_seat)
+        parse_paipu_wrapper(pb_data, stats_by_seat)
 
     return stats_by_seat
 
@@ -68,107 +68,123 @@ def fetch_paipu_pb(uuid: str) -> bytes:
     return None
 
 
-def parse_paipu_binary_direct(pb_data: bytes, stats_by_seat: dict):
+def parse_paipu_wrapper(data: bytes, stats_by_seat: dict):
     """
-    Protobuf バイナリ要素を走査し、アクション名（ActionName）と seat 属性を取得して集計
+    Wrapper レイヤーを剥がして内部のアクションログを解析
     """
-    # 雀魂のメッセージ名キーワードパターン
-    # ActionRiichi / RecordRiichi
-    # ActionChiPengGang / ActionAnGang / ActionMingGang
-    # ActionHule / RecordHule
-    
-    pos = 0
-    length = len(pb_data)
-    
-    # 全バイナリからアクション文字列の出現位置と seat をスキャン
-    raw_str = str(pb_data)
-    
-    # 1. 立直の検出
-    for seat in range(4):
-        # Riichi アクションパターン matches
-        riichi_patterns = [
-            f"Riichi".encode() + bytes([seat]),
-            f"riichi".encode() + bytes([seat]),
-            f"ActionRiichi".encode()
-        ]
-        # パターンカウントの概算
-        r_count = raw_str.count(f"ActionRiichi") // 4  # 全体からのフォールバック
-        
-    # より正確な Protobuf スキャン: 文字列トークンと隣接 varint (seat) の解析
-    tokens = extract_protobuf_tokens(pb_data)
-    
-    for i, token in enumerate(tokens):
-        if not isinstance(token, str):
-            continue
-            
-        # 立直イベントの判定
-        if "Riichi" in token or "riichi" in token:
-            # 付近の数値トークン（seat: 0~3）を探査
-            for j in range(max(0, i-3), min(len(tokens), i+4)):
-                if isinstance(tokens[j], int) and 0 <= tokens[j] <= 3:
-                    stats_by_seat[tokens[j]]["riichi_count"] += 1
-                    break
-
-        # 副露イベント（チー・ポン・カン）の判定
-        elif any(k in token for k in ["ChiPeng", "AnGang", "MingGang", "Peng", "Chi"]):
-            for j in range(max(0, i-3), min(len(tokens), i+4)):
-                if isinstance(tokens[j], int) and 0 <= tokens[j] <= 3:
-                    stats_by_seat[tokens[j]]["furo_count"] += 1
-                    break
-
-        # 和了イベント（Hule）の判定
-        elif "Hule" in token or "hule" in token:
-            # 付近の seat 情報から和了・放銃を集計
-            seats_found = []
-            for j in range(max(0, i-5), min(len(tokens), i+10)):
-                if isinstance(tokens[j], int) and 0 <= tokens[j] <= 3:
-                    seats_found.append(tokens[j])
-            
-            if seats_found:
-                win_seat = seats_found[0]
-                stats_by_seat[win_seat]["horyo_count"] += 1
-                
-                # 放銃者（ターゲット）が存在する場合
-                if len(seats_found) > 1:
-                    target_seat = seats_found[1]
-                    if target_seat != win_seat:
-                        stats_by_seat[target_seat]["hoju_count"] += 1
-
-
-def extract_protobuf_tokens(data: bytes) -> list:
-    """
-    Protobuf バイナリから varint (数値) と length-delimited (文字列) をトークン配列として抽出
-    """
-    tokens = []
     pos = 0
     length = len(data)
     
     while pos < length:
         try:
             key, pos = decoder._DecodeVarint32(data, pos)
+            field_num = key >> 3
             wire_type = key & 0x7
             
-            if wire_type == 0:  # Varint (数値)
-                val, pos = decoder._DecodeVarint32(data, pos)
-                tokens.append(val)
-            elif wire_type == 2:  # Length-delimited (文字列/バイト列)
+            if wire_type == 2:  # Length-delimited (Inner Payload)
                 size, pos = decoder._DecodeVarint32(data, pos)
                 sub_bytes = data[pos:pos+size]
                 pos += size
                 
-                try:
-                    text = sub_bytes.decode('utf-8')
-                    tokens.append(text)
-                except UnicodeDecodeError:
-                    # 再帰的に解析
-                    tokens.extend(extract_protobuf_tokens(sub_bytes))
+                # サブバイト列からアクションキーワードと数値パターンを解析
+                parse_action_payload(sub_bytes, stats_by_seat)
+                # 再帰的解析
+                parse_paipu_wrapper(sub_bytes, stats_by_seat)
+                
+            elif wire_type == 0:
+                _, pos = decoder._DecodeVarint32(data, pos)
             elif wire_type == 1:
                 pos += 8
             elif wire_type == 5:
                 pos += 4
             else:
-                pos += 1
+                break
         except Exception:
-            pos += 1
+            break
+
+
+def parse_action_payload(payload: bytes, stats_by_seat: dict):
+    """
+    各アクションブロックから和了・放銃・立直・副露イベントを直接判定
+    """
+    # 1. 立直 (ActionRiichi / RecordRiichi)
+    if b"Riichi" in payload or b"riichi" in payload:
+        seat = find_seat_in_payload(payload)
+        if seat is not None:
+            stats_by_seat[seat]["riichi_count"] += 1
+
+    # 2. 副露 (ActionChiPengGang / ActionAnGang / ActionMingGang)
+    elif any(k in payload for k in [b"ChiPeng", b"AnGang", b"MingGang", b"Peng", b"Chi"]):
+        seat = find_seat_in_payload(payload)
+        if seat is not None:
+            stats_by_seat[seat]["furo_count"] += 1
+
+    # 3. 和了・放銃 (ActionHule / RecordHule)
+    elif b"Hule" in payload or b"hule" in payload:
+        seats = find_all_seats_in_payload(payload)
+        if len(seats) >= 1:
+            win_seat = seats[0]
+            stats_by_seat[win_seat]["horyo_count"] += 1
             
-    return tokens
+            # 放銃者（ターゲット）の判定
+            if len(seats) >= 2:
+                target_seat = seats[1]
+                if target_seat != win_seat:
+                    stats_by_seat[target_seat]["hoju_count"] += 1
+
+
+def find_seat_in_payload(data: bytes) -> int:
+    """
+    ペイロード内の最初の Varint フィールド（seat: 0~3）を取り出す
+    """
+    pos = 0
+    length = len(data)
+    while pos < length:
+        try:
+            key, pos = decoder._DecodeVarint32(data, pos)
+            wire_type = key & 0x7
+            if wire_type == 0:
+                val, pos = decoder._DecodeVarint32(data, pos)
+                if 0 <= val <= 3:
+                    return val
+            elif wire_type == 2:
+                size, pos = decoder._DecodeVarint32(data, pos)
+                pos += size
+            elif wire_type == 1:
+                pos += 8
+            elif wire_type == 5:
+                pos += 4
+            else:
+                break
+        except Exception:
+            break
+    return None
+
+
+def find_all_seats_in_payload(data: bytes) -> list:
+    """
+    ペイロード内のすべての Varint フィールド（seat: 0~3）を取り出す
+    """
+    seats = []
+    pos = 0
+    length = len(data)
+    while pos < length:
+        try:
+            key, pos = decoder._DecodeVarint32(data, pos)
+            wire_type = key & 0x7
+            if wire_type == 0:
+                val, pos = decoder._DecodeVarint32(data, pos)
+                if 0 <= val <= 3:
+                    seats.append(val)
+            elif wire_type == 2:
+                size, pos = decoder._DecodeVarint32(data, pos)
+                pos += size
+            elif wire_type == 1:
+                pos += 8
+            elif wire_type == 5:
+                pos += 4
+            else:
+                break
+        except Exception:
+            break
+    return seats
