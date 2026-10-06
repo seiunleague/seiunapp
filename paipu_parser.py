@@ -6,7 +6,6 @@ from google.protobuf.internal import decoder
 def extract_uuid(paipu_input: str) -> str:
     """
     入力されたURLまたはIDから純粋な牌譜UUID（`_` 以前の文字列）を取り出す
-    例: https://game.mahjongsoul.com/?paipu=260926-xxx_a123 -> 260926-xxx
     """
     paipu_input = paipu_input.strip()
     match = re.search(r'paipu=([0-9a-zA-Z\-]+)', paipu_input)
@@ -15,7 +14,6 @@ def extract_uuid(paipu_input: str) -> str:
     else:
         uuid_raw = paipu_input
 
-    # `_a406440230` などの視点IDが付録している場合は切り外す
     return uuid_raw.split('_')[0]
 
 
@@ -30,7 +28,7 @@ def fetch_and_parse(paipu_input: str) -> dict:
             "horyo_count": 0,     # 和了回数
             "hoju_count": 0,      # 放銃回数
             "riichi_count": 0,    # 立直回数
-            "furo_count": 0,      # 副露回数
+            "furo_count": 0,      # 副露（ポン・チー・カン）回数
             "total_agari_pt": 0,  # 獲得素点合計
             "total_hoju_pt": 0    # 放銃失点合計
         }
@@ -40,7 +38,7 @@ def fetch_and_parse(paipu_input: str) -> dict:
     pb_data = fetch_paipu_pb(uuid)
 
     if pb_data:
-        parse_protobuf_binary(pb_data, stats_by_seat)
+        parse_paipu_binary_direct(pb_data, stats_by_seat)
 
     return stats_by_seat
 
@@ -49,7 +47,6 @@ def fetch_paipu_pb(uuid: str) -> bytes:
     """
     雀魂のエンドポイントから牌譜バイナリを取得
     """
-    # グローバル版・日本版共通エンドポイントの試行
     urls = [
         f"https://mahjongsoul.game.yo-star.com/danten/paipu/{uuid}",
         f"https://game.mahjongsoul.com/danten/paipu/{uuid}"
@@ -71,11 +68,78 @@ def fetch_paipu_pb(uuid: str) -> bytes:
     return None
 
 
-def extract_strings_from_protobuf(data: bytes) -> list:
+def parse_paipu_binary_direct(pb_data: bytes, stats_by_seat: dict):
     """
-    Protobuf バイナリから埋め込まれているテキスト/JSON要素を再帰抽出
+    Protobuf バイナリ要素を走査し、アクション名（ActionName）と seat 属性を取得して集計
     """
-    strings = []
+    # 雀魂のメッセージ名キーワードパターン
+    # ActionRiichi / RecordRiichi
+    # ActionChiPengGang / ActionAnGang / ActionMingGang
+    # ActionHule / RecordHule
+    
+    pos = 0
+    length = len(pb_data)
+    
+    # 全バイナリからアクション文字列の出現位置と seat をスキャン
+    raw_str = str(pb_data)
+    
+    # 1. 立直の検出
+    for seat in range(4):
+        # Riichi アクションパターン matches
+        riichi_patterns = [
+            f"Riichi".encode() + bytes([seat]),
+            f"riichi".encode() + bytes([seat]),
+            f"ActionRiichi".encode()
+        ]
+        # パターンカウントの概算
+        r_count = raw_str.count(f"ActionRiichi") // 4  # 全体からのフォールバック
+        
+    # より正確な Protobuf スキャン: 文字列トークンと隣接 varint (seat) の解析
+    tokens = extract_protobuf_tokens(pb_data)
+    
+    for i, token in enumerate(tokens):
+        if not isinstance(token, str):
+            continue
+            
+        # 立直イベントの判定
+        if "Riichi" in token or "riichi" in token:
+            # 付近の数値トークン（seat: 0~3）を探査
+            for j in range(max(0, i-3), min(len(tokens), i+4)):
+                if isinstance(tokens[j], int) and 0 <= tokens[j] <= 3:
+                    stats_by_seat[tokens[j]]["riichi_count"] += 1
+                    break
+
+        # 副露イベント（チー・ポン・カン）の判定
+        elif any(k in token for k in ["ChiPeng", "AnGang", "MingGang", "Peng", "Chi"]):
+            for j in range(max(0, i-3), min(len(tokens), i+4)):
+                if isinstance(tokens[j], int) and 0 <= tokens[j] <= 3:
+                    stats_by_seat[tokens[j]]["furo_count"] += 1
+                    break
+
+        # 和了イベント（Hule）の判定
+        elif "Hule" in token or "hule" in token:
+            # 付近の seat 情報から和了・放銃を集計
+            seats_found = []
+            for j in range(max(0, i-5), min(len(tokens), i+10)):
+                if isinstance(tokens[j], int) and 0 <= tokens[j] <= 3:
+                    seats_found.append(tokens[j])
+            
+            if seats_found:
+                win_seat = seats_found[0]
+                stats_by_seat[win_seat]["horyo_count"] += 1
+                
+                # 放銃者（ターゲット）が存在する場合
+                if len(seats_found) > 1:
+                    target_seat = seats_found[1]
+                    if target_seat != win_seat:
+                        stats_by_seat[target_seat]["hoju_count"] += 1
+
+
+def extract_protobuf_tokens(data: bytes) -> list:
+    """
+    Protobuf バイナリから varint (数値) と length-delimited (文字列) をトークン配列として抽出
+    """
+    tokens = []
     pos = 0
     length = len(data)
     
@@ -84,91 +148,27 @@ def extract_strings_from_protobuf(data: bytes) -> list:
             key, pos = decoder._DecodeVarint32(data, pos)
             wire_type = key & 0x7
             
-            if wire_type == 2:  # Length-delimited
+            if wire_type == 0:  # Varint (数値)
+                val, pos = decoder._DecodeVarint32(data, pos)
+                tokens.append(val)
+            elif wire_type == 2:  # Length-delimited (文字列/バイト列)
                 size, pos = decoder._DecodeVarint32(data, pos)
-                sub_data = data[pos:pos+size]
+                sub_bytes = data[pos:pos+size]
                 pos += size
                 
                 try:
-                    text = sub_data.decode('utf-8')
-                    # 有効な文字列/JSONらしきものを保持
-                    if len(text) > 3:
-                        strings.append(text)
+                    text = sub_bytes.decode('utf-8')
+                    tokens.append(text)
                 except UnicodeDecodeError:
-                    pass
-                
-                strings.extend(extract_strings_from_protobuf(sub_data))
-            elif wire_type == 0:
-                _, pos = decoder._DecodeVarint32(data, pos)
+                    # 再帰的に解析
+                    tokens.extend(extract_protobuf_tokens(sub_bytes))
             elif wire_type == 1:
                 pos += 8
             elif wire_type == 5:
                 pos += 4
             else:
-                break
+                pos += 1
         except Exception:
-            break
+            pos += 1
             
-    return strings
-
-
-def parse_protobuf_binary(pb_data: bytes, stats_by_seat: dict):
-    """
-    抽出された文字列および生バイナリ内のアクションキーワードからスタッツを集計
-    """
-    extracted_strings = extract_strings_from_protobuf(pb_data)
-    full_str = " ".join(extracted_strings)
-
-    # 1. JSON ログ要素の抽出と解析
-    parsed_any = False
-    for text in extracted_strings:
-        if text.startswith('{') and text.endswith('}'):
-            try:
-                data = json.loads(text)
-                name = data.get("name", "")
-                data_body = data.get("data", {})
-                
-                if "Riichi" in name or "riichi" in data_body:
-                    seat = data_body.get("seat")
-                    if seat is not None and 0 <= int(seat) <= 3:
-                        stats_by_seat[int(seat)]["riichi_count"] += 1
-                        parsed_any = True
-
-                if any(k in name for k in ["ChiPeng", "AnGang", "MingGang"]):
-                    seat = data_body.get("seat")
-                    if seat is not None and 0 <= int(seat) <= 3:
-                        stats_by_seat[int(seat)]["furo_count"] += 1
-                        parsed_any = True
-
-                if "Hule" in name or "hule" in data_body:
-                    hule_list = data_body.get("hule", [])
-                    if isinstance(hule_list, dict):
-                        hule_list = [hule_list]
-                        
-                    for hule in hule_list:
-                        win_seat = hule.get("seat")
-                        target_seat = hule.get("target")
-                        score = hule.get("score", 0)
-
-                        if win_seat is not None and 0 <= int(win_seat) <= 3:
-                            stats_by_seat[int(win_seat)]["horyo_count"] += 1
-                            stats_by_seat[int(win_seat)]["total_agari_pt"] += score
-                            parsed_any = True
-
-                        if target_seat is not None and target_seat != win_seat and 0 <= int(target_seat) <= 3:
-                            stats_by_seat[int(target_seat)]["hoju_count"] += 1
-                            stats_by_seat[int(target_seat)]["total_hoju_pt"] += score
-                            parsed_any = True
-            except Exception:
-                pass
-
-    # 2. アクションメッセージの直接スキャン（フォールバック）
-    if not parsed_any:
-        # Record/Action キーワードパターンのカウント
-        for seat in range(4):
-            # 席IDに関連付けられたアクション文字列パターンを探査
-            riichi_matches = len(re.findall(f'ActionRiichi.*?seat.*?:.*?{seat}', full_str))
-            furo_matches = len(re.findall(f'ActionChiPengGang.*?seat.*?:.*?{seat}', full_str))
-            
-            stats_by_seat[seat]["riichi_count"] += riichi_matches
-            stats_by_seat[seat]["furo_count"] += furo_matches
+    return tokens
