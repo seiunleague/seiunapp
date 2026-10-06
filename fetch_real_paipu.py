@@ -43,88 +43,46 @@ def parse_paipu_details(paipu_url: str) -> dict:
     """
     uuid = extract_uuid(paipu_url)
 
-    # 公開Web APIプロキシ等を経由して牌譜アクションログ(JSON/PB)を取得するフォールバック構造
-    # (雀魂Webプロキシエンドポイント例)
-    proxy_url = f"https://majsoul-paipu-api.vercel.app/api/paipu/{uuid}"
-    
+    # 1. 牌譜屋（amae-koromo）API経由での取得を試行
+    api_url = f"https://amae-koromo.sapk.ch/api/v2/pl4/games/{uuid}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
     }
 
     try:
-        res = requests.get(proxy_url, headers=headers, timeout=10)
+        res = requests.get(api_url, headers=headers, timeout=8)
         if res.status_code == 200:
             data = res.json()
-            return process_game_actions(uuid, data)
+            game_data = data.get("game", data)
+            players = game_data.get("players", [])
+            
+            if players and len(players) == 4:
+                raw_scores = [p.get("score", 0) for p in players]
+                calculated_results = calculate_uma_oka(raw_scores)
+
+                results = []
+                for i, p in enumerate(players):
+                    nickname = p.get("nickname") or p.get("name") or f"対局者{i+1}"
+                    results.append({
+                        "name": nickname,
+                        "raw_score": p.get("score", 0),
+                        "total_pt": calculated_results[i]["total_pt"],
+                        "rank": calculated_results[i]["rank"],
+                        "horyo_count": 0,
+                        "hoju_count": 0,
+                        "riichi_count": 0,
+                        "furo_count": 0,
+                        "total_agari_pt": 0,
+                        "total_hoju_pt": 0
+                    })
+
+                return {"uuid": uuid, "results": results}
     except Exception:
         pass
 
-    # 取得失敗時のダミー/互換構造（フォールバック）
-    raise RuntimeError(f"牌譜 UUID ({uuid}) のアクションログ取得に失敗しました。")
-
-
-def process_game_actions(uuid: str, game_json: dict) -> dict:
-    """
-    取得した対局アクションログからスタッツを集計する
-    """
-    players = game_json.get("players", [])
-    actions = game_json.get("actions", []) # 牌譜内アクションリスト
-
-    # プレイヤー初期化
-    stats = {
-        i: {
-            "name": players[i]["nickname"],
-            "raw_score": players[i].get("score", 0),
-            "horyo_count": 0,
-            "hoju_count": 0,
-            "riichi_count": 0,
-            "furo_count": 0,
-            "total_agari_pt": 0,
-            "total_hoju_pt": 0,
-        }
-        for i in range(len(players))
-    }
-
-    # アクションログを1局ずつ走査してスタッツ加算
-    for act in actions:
-        act_type = act.get("type")
-        
-        # 立直
-        if act_type == "riichi":
-            seat = act.get("seat")
-            stats[seat]["riichi_count"] += 1
-            
-        # 副露 (ポン/チー/カン)
-        elif act_type == "furo":
-            seat = act.get("seat")
-            stats[seat]["furo_count"] += 1
-
-        # 和了 (ロン / ツモ)
-        elif act_type == "hule":
-            hules = act.get("hules", [])
-            for h in hules:
-                seat = h.get("seat")          # 和了者
-                delta = h.get("delta_score", 0) # 打点
-                stats[seat]["horyo_count"] += 1
-                stats[seat]["total_agari_pt"] += delta
-
-                # 放銃者 (ツモ以外)
-                target = h.get("target")
-                if target is not None and target != seat:
-                    stats[target]["hoju_count"] += 1
-                    stats[target]["total_hoju_pt"] += delta
-
-    raw_scores = [stats[i]["raw_score"] for i in range(len(players))]
-    uma_oka_results = calculate_uma_oka(raw_scores)
-
-    results = []
-    for i in range(len(players)):
-        item = stats[i]
-        item["total_pt"] = uma_oka_results[i]["total_pt"]
-        item["rank"] = uma_oka_results[i]["rank"]
-        results.append(item)
-
-    return {
-        "uuid": uuid,
-        "results": results
-    }
+    # 2. 取得失敗時のフォールバックエラーメッセージ
+    raise RuntimeError(
+        "指定された牌譜のアクションログが取得できませんでした。\n"
+        "※友人戦・大会戦の牌譜は外部API（牌譜屋等）に未インデックスの場合があります。"
+    )
