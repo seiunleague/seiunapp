@@ -16,6 +16,7 @@ def extract_uuid(paipu_input: str) -> str:
 
 def fetch_and_parse(paipu_input: str) -> dict:
     uuid = extract_uuid(paipu_input)
+    print(f"--- [DEBUG] Extracted UUID: {uuid} ---")
     
     stats_by_seat = {
         seat: {
@@ -32,7 +33,10 @@ def fetch_and_parse(paipu_input: str) -> dict:
     pb_data = fetch_paipu_pb(uuid)
 
     if pb_data:
+        print(f"--- [DEBUG] Downloaded Data Size: {len(pb_data)} bytes ---")
         scan_raw_binary(pb_data, stats_by_seat)
+    else:
+        print("--- [DEBUG] Failed to download paipu binary (pb_data is None) ---")
 
     return stats_by_seat
 
@@ -44,26 +48,23 @@ def fetch_paipu_pb(uuid: str) -> bytes:
     ]
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://game.mahjongsoul.com/"
     }
     
     for url in urls:
         try:
             res = requests.get(url, headers=headers, timeout=10)
+            print(f"--- [DEBUG] Fetching {url} -> Status: {res.status_code}, Length: {len(res.content)} ---")
             if res.status_code == 200 and len(res.content) > 0:
                 return res.content
         except Exception as e:
-            print(f"Fetch error: {e}")
+            print(f"--- [DEBUG] Fetch Error ({url}): {e} ---")
             
     return None
 
 
 def scan_raw_binary(data: bytes, stats_by_seat: dict):
-    """
-    Protobuf バイナリ内の文字列アクション識別子と seat (0-3) の相対位置を全走査
-    """
-    # 1. 牌譜データ全体のバイト列内で Action/Record 名の位置を検索
     actions = [
         (b"ActionRiichi", "riichi"),
         (b"RecordRiichi", "riichi"),
@@ -74,6 +75,7 @@ def scan_raw_binary(data: bytes, stats_by_seat: dict):
         (b"RecordHule", "hule"),
     ]
 
+    match_found = False
     for pattern, act_type in actions:
         start = 0
         while True:
@@ -81,7 +83,9 @@ def scan_raw_binary(data: bytes, stats_by_seat: dict):
             if idx == -1:
                 break
             
-            # 発見位置の後方 50 バイト以内の Varint/数値（seat: 0~3）を探索
+            match_found = True
+            print(f"--- [DEBUG] Found Pattern {pattern} at index {idx} ---")
+            
             window = data[idx : idx + 60]
             seats = find_seats_in_window(window)
             
@@ -98,11 +102,11 @@ def scan_raw_binary(data: bytes, stats_by_seat: dict):
 
             start = idx + len(pattern)
 
+    if not match_found:
+        print("--- [DEBUG] No Action/Record patterns matched in binary ---")
+
 
 def find_seats_in_window(window: bytes) -> list:
-    """
-    バイトウィンドウ内から 0~3 範囲の seat 候補値を抽出
-    """
     seats = []
     pos = 0
     length = len(window)
