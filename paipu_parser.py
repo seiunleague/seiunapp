@@ -1,5 +1,6 @@
 import re
 import requests
+import streamlit as st
 
 def extract_uuid(paipu_input: str) -> str:
     """
@@ -12,15 +13,12 @@ def extract_uuid(paipu_input: str) -> str:
     else:
         uuid_raw = paipu_input
 
-    # `_a406440230` などの視点IDが付加されている場合は切り離す
     return uuid_raw.split('_')[0]
 
 
 def fetch_and_parse(paipu_input: str) -> dict:
-    """
-    雀魂の牌譜UUIDからログを取得し、各席（0:東家, 1:南家, 2:西家, 3:北家）のスタッツを集計する
-    """
     uuid = extract_uuid(paipu_input)
+    st.info(f"🔍 解析対象 UUID: `{uuid}`")
     
     stats_by_seat = {
         seat: {
@@ -34,41 +32,50 @@ def fetch_and_parse(paipu_input: str) -> dict:
         for seat in range(4)
     }
 
-    # 1. 外部 API または代替取得プロキシ経由でパース済みログを取得
     paipu_json = fetch_paipu_json(uuid)
 
     if paipu_json:
         parse_json_log(paipu_json, stats_by_seat)
+        st.success("✅ 牌譜データの解析に成功しました！")
+    else:
+        st.error("❌ 牌譜データの取得に失敗しました。UUID または API 接続を確認してください。")
 
     return stats_by_seat
 
 
 def fetch_paipu_json(uuid: str) -> dict:
     """
-    牌譜プロキシ API から構造化 JSON を取得する
+    牌譜プロキシ API から JSON を取得
     """
-    # 雀魂牌譜変換 API エンドポイント
     url = f"https://amae-koromo.sapk.ch/api/v2/plog/{uuid}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     try:
         res = requests.get(url, headers=headers, timeout=10)
+        st.caption(f"🌐 API レスポンスステータス: `{res.status_code}`")
+        
         if res.status_code == 200:
             return res.json()
+        else:
+            st.warning(f"⚠️ API エラーレスポンス (HTTP {res.status_code}): {res.text[:200]}")
     except Exception as e:
-        print(f"API Fetch Error: {e}")
+        st.error(f"🚨 通信例外が発生しました: {e}")
         
     return None
 
 
 def parse_json_log(data: dict, stats_by_seat: dict):
     """
-    取得した JSON ログから各局のイベント（和了・放銃・立直・副露）を正しく集計する
+    JSON ログからイベントを集計
     """
     rounds = data.get("log", [])
-    
+    if not rounds and "rounds" in data:
+        rounds = data.get("rounds", [])
+        
+    st.caption(f"📊 総局数: {len(rounds)} 局")
+
     for round_data in rounds:
         if not isinstance(round_data, list):
             continue
@@ -77,19 +84,19 @@ def parse_json_log(data: dict, stats_by_seat: dict):
             if not isinstance(action, dict):
                 continue
                 
-            # 1. 立直の検出
+            # 立直
             if "riichi" in action or action.get("type") == "riichi":
                 seat = action.get("seat")
                 if seat is not None and 0 <= int(seat) <= 3:
                     stats_by_seat[int(seat)]["riichi_count"] += 1
 
-            # 2. 副露（チー・ポン・カン）の検出
+            # 副露
             elif action.get("type") in ["chi", "peng", "gang", "angang", "minggang"]:
                 seat = action.get("seat")
                 if seat is not None and 0 <= int(seat) <= 3:
                     stats_by_seat[int(seat)]["furo_count"] += 1
 
-            # 3. 和了・放銃（hule）の検出
+            # 和了・放銃
             elif action.get("type") == "hule" or "hule" in action:
                 hule_info = action.get("hule", action)
                 win_seat = hule_info.get("seat")
@@ -100,7 +107,6 @@ def parse_json_log(data: dict, stats_by_seat: dict):
                     stats_by_seat[int(win_seat)]["horyo_count"] += 1
                     stats_by_seat[int(win_seat)]["total_agari_pt"] += score
 
-                # ロン放銃者の集計（ツモ以外かつ自分以外）
                 if target_seat is not None and target_seat != win_seat and 0 <= int(target_seat) <= 3:
                     stats_by_seat[int(target_seat)]["hoju_count"] += 1
                     stats_by_seat[int(target_seat)]["total_hoju_pt"] += score
