@@ -1,9 +1,10 @@
 import re
 import requests
-import json
-from google.protobuf.internal import decoder
 
 def extract_uuid(paipu_input: str) -> str:
+    """
+    入力文字列から牌譜 UUID（`260926-xxxx-xxxx...`）を抽出する
+    """
     paipu_input = paipu_input.strip()
     match = re.search(r'paipu=([0-9a-zA-Z\-]+)', paipu_input)
     if match:
@@ -11,12 +12,15 @@ def extract_uuid(paipu_input: str) -> str:
     else:
         uuid_raw = paipu_input
 
+    # `_a406440230` などの視点IDが付加されている場合は切り離す
     return uuid_raw.split('_')[0]
 
 
 def fetch_and_parse(paipu_input: str) -> dict:
+    """
+    雀魂の牌譜UUIDからログを取得し、各席（0:東家, 1:南家, 2:西家, 3:北家）のスタッツを集計する
+    """
     uuid = extract_uuid(paipu_input)
-    print(f"--- [DEBUG] Extracted UUID: {uuid} ---")
     
     stats_by_seat = {
         seat: {
@@ -30,104 +34,73 @@ def fetch_and_parse(paipu_input: str) -> dict:
         for seat in range(4)
     }
 
-    pb_data = fetch_paipu_pb(uuid)
+    # 1. 外部 API または代替取得プロキシ経由でパース済みログを取得
+    paipu_json = fetch_paipu_json(uuid)
 
-    if pb_data:
-        print(f"--- [DEBUG] Downloaded Data Size: {len(pb_data)} bytes ---")
-        scan_raw_binary(pb_data, stats_by_seat)
-    else:
-        print("--- [DEBUG] Failed to download paipu binary (pb_data is None) ---")
+    if paipu_json:
+        parse_json_log(paipu_json, stats_by_seat)
 
     return stats_by_seat
 
 
-def fetch_paipu_pb(uuid: str) -> bytes:
-    urls = [
-        f"https://mahjongsoul.game.yo-star.com/danten/paipu/{uuid}",
-        f"https://game.mahjongsoul.com/danten/paipu/{uuid}"
-    ]
-    
+def fetch_paipu_json(uuid: str) -> dict:
+    """
+    牌譜プロキシ API から構造化 JSON を取得する
+    """
+    # 雀魂牌譜変換 API エンドポイント
+    url = f"https://amae-koromo.sapk.ch/api/v2/plog/{uuid}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://game.mahjongsoul.com/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
     
-    for url in urls:
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            print(f"--- [DEBUG] Fetching {url} -> Status: {res.status_code}, Length: {len(res.content)} ---")
-            if res.status_code == 200 and len(res.content) > 0:
-                return res.content
-        except Exception as e:
-            print(f"--- [DEBUG] Fetch Error ({url}): {e} ---")
-            
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"API Fetch Error: {e}")
+        
     return None
 
 
-def scan_raw_binary(data: bytes, stats_by_seat: dict):
-    actions = [
-        (b"ActionRiichi", "riichi"),
-        (b"RecordRiichi", "riichi"),
-        (b"ActionChiPengGang", "furo"),
-        (b"ActionAnGang", "furo"),
-        (b"ActionMingGang", "furo"),
-        (b"ActionHule", "hule"),
-        (b"RecordHule", "hule"),
-    ]
-
-    match_found = False
-    for pattern, act_type in actions:
-        start = 0
-        while True:
-            idx = data.find(pattern, start)
-            if idx == -1:
-                break
-            
-            match_found = True
-            print(f"--- [DEBUG] Found Pattern {pattern} at index {idx} ---")
-            
-            window = data[idx : idx + 60]
-            seats = find_seats_in_window(window)
-            
-            if seats:
-                seat = seats[0]
-                if act_type == "riichi":
-                    stats_by_seat[seat]["riichi_count"] += 1
-                elif act_type == "furo":
-                    stats_by_seat[seat]["furo_count"] += 1
-                elif act_type == "hule":
-                    stats_by_seat[seat]["horyo_count"] += 1
-                    if len(seats) > 1 and seats[1] != seat:
-                        stats_by_seat[seats[1]]["hoju_count"] += 1
-
-            start = idx + len(pattern)
-
-    if not match_found:
-        print("--- [DEBUG] No Action/Record patterns matched in binary ---")
-
-
-def find_seats_in_window(window: bytes) -> list:
-    seats = []
-    pos = 0
-    length = len(window)
+def parse_json_log(data: dict, stats_by_seat: dict):
+    """
+    取得した JSON ログから各局のイベント（和了・放銃・立直・副露）を正しく集計する
+    """
+    rounds = data.get("log", [])
     
-    while pos < length:
-        try:
-            key, pos = decoder._DecodeVarint32(window, pos)
-            wire_type = key & 0x7
-            if wire_type == 0:
-                val, pos = decoder._DecodeVarint32(window, pos)
-                if 0 <= val <= 3:
-                    seats.append(val)
-            elif wire_type == 2:
-                size, pos = decoder._DecodeVarint32(window, pos)
-                pos += size
-            elif wire_type == 1:
-                pos += 8
-            elif wire_type == 5:
-                pos += 4
-            else:
-                pos += 1
-        except Exception:
-            pos += 1
-    return seats
+    for round_data in rounds:
+        if not isinstance(round_data, list):
+            continue
+            
+        for action in round_data:
+            if not isinstance(action, dict):
+                continue
+                
+            # 1. 立直の検出
+            if "riichi" in action or action.get("type") == "riichi":
+                seat = action.get("seat")
+                if seat is not None and 0 <= int(seat) <= 3:
+                    stats_by_seat[int(seat)]["riichi_count"] += 1
+
+            # 2. 副露（チー・ポン・カン）の検出
+            elif action.get("type") in ["chi", "peng", "gang", "angang", "minggang"]:
+                seat = action.get("seat")
+                if seat is not None and 0 <= int(seat) <= 3:
+                    stats_by_seat[int(seat)]["furo_count"] += 1
+
+            # 3. 和了・放銃（hule）の検出
+            elif action.get("type") == "hule" or "hule" in action:
+                hule_info = action.get("hule", action)
+                win_seat = hule_info.get("seat")
+                target_seat = hule_info.get("target")
+                score = hule_info.get("score", 0)
+
+                if win_seat is not None and 0 <= int(win_seat) <= 3:
+                    stats_by_seat[int(win_seat)]["horyo_count"] += 1
+                    stats_by_seat[int(win_seat)]["total_agari_pt"] += score
+
+                # ロン放銃者の集計（ツモ以外かつ自分以外）
+                if target_seat is not None and target_seat != win_seat and 0 <= int(target_seat) <= 3:
+                    stats_by_seat[int(target_seat)]["hoju_count"] += 1
+                    stats_by_seat[int(target_seat)]["total_hoju_pt"] += score
