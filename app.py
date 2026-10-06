@@ -65,7 +65,11 @@ if st.button("牌譜データを取得・解析"):
                     })
                 
                 # upsert 実行
-                response = supabase.table("scores").upsert(records).execute()
+                # on_conflict="paipu_id, seat" を指定して重複時に上書き更新（UPDATE）させる
+                response = supabase.table("scores").upsert(
+                    records, 
+                    on_conflict="paipu_id, seat"
+                ).execute()
                 st.success("✅ Supabase へのデータ登録が正常に完了しました！")
 
         except Exception as e:
