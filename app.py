@@ -2,7 +2,9 @@ import json
 import re
 import asyncio
 import websockets
-import liqi_pb2  # 自動生成されたProtobufモジュール
+import liqi_pb2
+
+  # 自動生成されたProtobufモジュール
 
 def parse_paipu_id(url_or_id: str) -> str:
     """牌譜URLまたは文字列からID(UUID)を抽出"""
@@ -107,3 +109,22 @@ def extract_game_stats_from_id(paipu_id: str):
         2: {"horyo_count": 0, "hoju_count": 0, "riichi_count": 2, "furo_count": 0, "total_agari_pt": 0, "total_hoju_pt": 0},
         3: {"horyo_count": 3, "hoju_count": 0, "riichi_count": 1, "furo_count": 1, "total_agari_pt": 18000, "total_hoju_pt": 0},
     }
+
+import streamlit as st
+from supabase import create_client, Client
+
+# Supabase 接続の初期化 (エラーハンドリング付き)
+@st.cache_resource
+def init_supabase() -> Client:
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_KEY")
+        if not url or not key:
+            st.error("⚠️ Streamlit Secrets に SUPABASE_URL または SUPABASE_KEY が設定されていません。")
+            st.stop()
+        return create_client(url, key)
+    except Exception as e:
+        st.error(f"⚠️ Supabase 接続エラー: {e}")
+        st.stop()
+
+supabase = init_supabase()
