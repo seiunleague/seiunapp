@@ -73,3 +73,45 @@ def extract_game_stats(game_record_bytes: bytes):
                 pass
 
     return stats
+
+def fetch_and_parse(paipu_id: str) -> dict:
+    """
+    指定された paipu_id の牌譜データを取得・解析し、各席のスタッツ辞書を返します。
+    （WebSocket通信またはフォールバック用のテストデータ生成）
+    """
+    # 実際の実装がある場合はそれを実行
+    # まだ通信実装のテスト段階の場合は、以下のようにダミー/テストデータを返すロジック
+    return {
+        0: {
+            "horyo_count": 2,
+            "hoju_count": 1,
+            "riichi_count": 3,
+            "furo_count": 1,
+            "total_agari_pt": 12000,
+            "total_hoju_pt": -3000,
+        },
+        1: {
+            "horyo_count": 1,
+            "hoju_count": 2,
+            "riichi_count": 1,
+            "furo_count": 2,
+            "total_agari_pt": 3900,
+            "total_hoju_pt": -12000,
+        },
+        2: {
+            "horyo_count": 0,
+            "hoju_count": 0,
+            "riichi_count": 2,
+            "furo_count": 0,
+            "total_agari_pt": 0,
+            "total_hoju_pt": 0,
+        },
+        3: {
+            "horyo_count": 1,
+            "hoju_count": 0,
+            "riichi_count": 0,
+            "furo_count": 3,
+            "total_agari_pt": 8000,
+            "total_hoju_pt": 0,
+        },
+    }
