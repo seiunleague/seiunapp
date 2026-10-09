@@ -1,25 +1,10 @@
-import re
-import json
-import base64
 import streamlit as st
-from curl_cffi import requests
 from google.protobuf.internal import decoder
 
-def extract_uuid(paipu_input: str) -> str:
-    paipu_input = paipu_input.strip()
-    match = re.search(r'paipu=([0-9a-zA-Z\-]+)', paipu_input)
-    if match:
-        uuid_raw = match.group(1)
-    else:
-        uuid_raw = paipu_input
-
-    return uuid_raw.split('_')[0]
-
-
-def fetch_and_parse(paipu_input: str) -> dict:
-    uuid = extract_uuid(paipu_input)
-    st.info(f"🔍 解析対象 UUID: `{uuid}`")
-    
+def parse_bytes(pb_data: bytes) -> dict:
+    """
+    受け取った牌譜バイナリ（bytes）から各席（0:東家, 1:南家, 2:西家, 3:北家）のスタッツを集計する
+    """
     stats_by_seat = {
         seat: {
             "horyo_count": 0,     # 和了回数
@@ -32,65 +17,14 @@ def fetch_and_parse(paipu_input: str) -> dict:
         for seat in range(4)
     }
 
-    pb_data = fetch_paipu_pb_with_proxy(uuid)
-
-    if pb_data:
-        st.caption(f"📦 牌譜バイナリ取得成功: `{len(pb_data)} bytes`")
-        parse_binary_actions(pb_data, stats_by_seat)
-        st.success("✅ 牌譜バイナリの解析が完了しました！")
-    else:
-        st.error("❌ 牌譜データの取得に失敗しました。")
-
+    parse_binary_actions(pb_data, stats_by_seat)
     return stats_by_seat
 
 
-def fetch_paipu_pb_with_proxy(uuid: str) -> bytes:
-    """
-    直接取得を試し、403 ブロック時はプロキシ経由でバイト列を取得する
-    """
-    raw_urls = [
-        f"https://mahjongsoul.game.yo-star.com/danten/paipu/{uuid}",
-        f"https://game.mahjongsoul.com/danten/paipu/{uuid}"
-    ]
-    
-    headers = {
-        "Accept": "*/*",
-        "Referer": "https://game.mahjongsoul.com/",
-    }
-
-    # 1. 直接リクエスト試行
-    for url in raw_urls:
-        try:
-            res = requests.get(url, headers=headers, impersonate="chrome120", timeout=10)
-            st.caption(f"🌐 Direct Fetch `{url}` -> HTTP `{res.status_code}` ({len(res.content)} bytes)")
-            if res.status_code == 200 and len(res.content) > 500:
-                return res.content
-        except Exception as e:
-            st.warning(f"⚠ Direct Fetch Error: {e}")
-
-    # 2. IPブロック（403）回避のため AllOrigins プロキシ経由で取得
-    st.caption("🔄 プロキシ経由でのフェッチに切り替えます...")
-    for target_url in raw_urls:
-        proxy_url = f"https://api.allorigins.win/get?url={requests.utils.quote(target_url)}"
-        try:
-            res = requests.get(proxy_url, impersonate="chrome120", timeout=15)
-            st.caption(f"🌐 Proxy Fetch `{target_url}` -> HTTP `{res.status_code}`")
-            
-            if res.status_code == 200:
-                data = res.json()
-                contents = data.get("contents", "")
-                if contents.startswith("data:application/octet-stream;base64,"):
-                    base64_str = contents.split(",", 1)[1]
-                    return base64.b64decode(base64_str)
-                elif contents:
-                    return contents.encode('latin1')
-        except Exception as e:
-            st.warning(f"⚠ Proxy Error: {e}")
-
-    return None
-
-
 def parse_binary_actions(data: bytes, stats_by_seat: dict):
+    """
+    Protobuf バイナリ内の Action/Record タグをスキャンして集計
+    """
     patterns = [
         (b"ActionRiichi", "riichi"),
         (b"RecordRiichi", "riichi"),
