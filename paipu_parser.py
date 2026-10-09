@@ -1,11 +1,9 @@
 import re
 import requests
 import streamlit as st
+from google.protobuf.internal import decoder
 
 def extract_uuid(paipu_input: str) -> str:
-    """
-    入力文字列から牌譜 UUID（`260926-xxxx-xxxx...`）を抽出する
-    """
     paipu_input = paipu_input.strip()
     match = re.search(r'paipu=([0-9a-zA-Z\-]+)', paipu_input)
     if match:
@@ -32,81 +30,110 @@ def fetch_and_parse(paipu_input: str) -> dict:
         for seat in range(4)
     }
 
-    paipu_json = fetch_paipu_json(uuid)
+    # 1. 雀魂公式サーバーから牌譜バイナリを直接取得
+    pb_data = fetch_paipu_pb(uuid)
 
-    if paipu_json:
-        parse_json_log(paipu_json, stats_by_seat)
-        st.success("✅ 牌譜データの解析に成功しました！")
+    if pb_data:
+        st.caption(f"📦 牌譜バイナリ取得成功: `{len(pb_data)} bytes`")
+        parse_binary_actions(pb_data, stats_by_seat)
+        st.success("✅ 牌譜バイナリの解析が完了しました！")
     else:
-        st.error("❌ 牌譜データの取得に失敗しました。UUID または API 接続を確認してください。")
+        st.error("❌ 牌譜データの取得に失敗しました。UUID を確認してください。")
 
     return stats_by_seat
 
 
-def fetch_paipu_json(uuid: str) -> dict:
-    """
-    牌譜プロキシ API から JSON を取得
-    """
-    url = f"https://amae-koromo.sapk.ch/api/v2/plog/{uuid}"
+def fetch_paipu_pb(uuid: str) -> bytes:
+    urls = [
+        f"https://mahjongsoul.game.yo-star.com/danten/paipu/{uuid}",
+        f"https://game.mahjongsoul.com/danten/paipu/{uuid}"
+    ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://game.mahjongsoul.com/"
     }
     
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        st.caption(f"🌐 API レスポンスステータス: `{res.status_code}`")
-        
-        if res.status_code == 200:
-            return res.json()
-        else:
-            st.warning(f"⚠️ API エラーレスポンス (HTTP {res.status_code}): {res.text[:200]}")
-    except Exception as e:
-        st.error(f"🚨 通信例外が発生しました: {e}")
-        
+    for url in urls:
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            st.caption(f"🌐 Fetch `{url}` -> HTTP `{res.status_code}` (`{len(res.content)}` bytes)")
+            if res.status_code == 200 and len(res.content) > 0:
+                return res.content
+        except Exception as e:
+            st.warning(f"⚠️️ Fetch Error (`{url}`): {e}")
+            
     return None
 
 
-def parse_json_log(data: dict, stats_by_seat: dict):
+def parse_binary_actions(data: bytes, stats_by_seat: dict):
     """
-    JSON ログからイベントを集計
+    Protobuf バイナリから Action/Record タグをスキャンし、各席の数値を集計
     """
-    rounds = data.get("log", [])
-    if not rounds and "rounds" in data:
-        rounds = data.get("rounds", [])
-        
-    st.caption(f"📊 総局数: {len(rounds)} 局")
+    # 雀魂のアクション文字列パターン
+    patterns = [
+        (b"ActionRiichi", "riichi"),
+        (b"RecordRiichi", "riichi"),
+        (b"ActionChiPengGang", "furo"),
+        (b"ActionAnGang", "furo"),
+        (b"ActionMingGang", "furo"),
+        (b"ActionHule", "hule"),
+        (b"RecordHule", "hule"),
+    ]
 
-    for round_data in rounds:
-        if not isinstance(round_data, list):
-            continue
+    total_matches = 0
+    for pattern, act_type in patterns:
+        start = 0
+        while True:
+            idx = data.find(pattern, start)
+            if idx == -1:
+                break
             
-        for action in round_data:
-            if not isinstance(action, dict):
-                continue
-                
-            # 立直
-            if "riichi" in action or action.get("type") == "riichi":
-                seat = action.get("seat")
-                if seat is not None and 0 <= int(seat) <= 3:
-                    stats_by_seat[int(seat)]["riichi_count"] += 1
+            total_matches += 1
+            # パターン発見位置の後方 80 バイトから seat (0~3) を探査
+            window = data[idx : idx + 80]
+            seats = extract_varint_seats(window)
+            
+            if seats:
+                seat = seats[0]
+                if act_type == "riichi":
+                    stats_by_seat[seat]["riichi_count"] += 1
+                elif act_type == "furo":
+                    stats_by_seat[seat]["furo_count"] += 1
+                elif act_type == "hule":
+                    stats_by_seat[seat]["horyo_count"] += 1
+                    if len(seats) > 1 and seats[1] != seat:
+                        stats_by_seat[seats[1]]["hoju_count"] += 1
 
-            # 副露
-            elif action.get("type") in ["chi", "peng", "gang", "angang", "minggang"]:
-                seat = action.get("seat")
-                if seat is not None and 0 <= int(seat) <= 3:
-                    stats_by_seat[int(seat)]["furo_count"] += 1
+            start = idx + len(pattern)
 
-            # 和了・放銃
-            elif action.get("type") == "hule" or "hule" in action:
-                hule_info = action.get("hule", action)
-                win_seat = hule_info.get("seat")
-                target_seat = hule_info.get("target")
-                score = hule_info.get("score", 0)
+    st.caption(f"🎯 検出アクションパターン数: `{total_matches}` 件")
 
-                if win_seat is not None and 0 <= int(win_seat) <= 3:
-                    stats_by_seat[int(win_seat)]["horyo_count"] += 1
-                    stats_by_seat[int(win_seat)]["total_agari_pt"] += score
 
-                if target_seat is not None and target_seat != win_seat and 0 <= int(target_seat) <= 3:
-                    stats_by_seat[int(target_seat)]["hoju_count"] += 1
-                    stats_by_seat[int(target_seat)]["total_hoju_pt"] += score
+def extract_varint_seats(window: bytes) -> list:
+    """
+    バイトウィンドウ内から seat 候補（0~3）を解析
+    """
+    seats = []
+    pos = 0
+    length = len(window)
+    
+    while pos < length:
+        try:
+            key, pos = decoder._DecodeVarint32(window, pos)
+            wire_type = key & 0x7
+            if wire_type == 0:
+                val, pos = decoder._DecodeVarint32(window, pos)
+                if 0 <= val <= 3:
+                    seats.append(val)
+            elif wire_type == 2:
+                size, pos = decoder._DecodeVarint32(window, pos)
+                pos += size
+            elif wire_type == 1:
+                pos += 8
+            elif wire_type == 5:
+                pos += 4
+            else:
+                pos += 1
+        except Exception:
+            pos += 1
+    return seats
