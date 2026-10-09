@@ -30,7 +30,6 @@ def fetch_and_parse(paipu_input: str) -> dict:
         for seat in range(4)
     }
 
-    # 1. 雀魂公式サーバーから牌譜バイナリを直接取得
     pb_data = fetch_paipu_pb(uuid)
 
     if pb_data:
@@ -38,38 +37,52 @@ def fetch_and_parse(paipu_input: str) -> dict:
         parse_binary_actions(pb_data, stats_by_seat)
         st.success("✅ 牌譜バイナリの解析が完了しました！")
     else:
-        st.error("❌ 牌譜データの取得に失敗しました。UUID を確認してください。")
+        st.error("❌ 牌譜データの取得に失敗しました (403 Forbidden)。")
 
     return stats_by_seat
 
 
 def fetch_paipu_pb(uuid: str) -> bytes:
+    """
+    Cloudflare 403 ブロックを回避するためのブラウザ擬装リクエスト
+    """
     urls = [
         f"https://mahjongsoul.game.yo-star.com/danten/paipu/{uuid}",
         f"https://game.mahjongsoul.com/danten/paipu/{uuid}"
     ]
+    
+    # ブラウザの完全なヘッダー構造を模倣
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://game.mahjongsoul.com/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Origin": "https://game.mahjongsoul.com",
+        "Referer": "https://game.mahjongsoul.com/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"'
     }
+    
+    session = requests.Session()
     
     for url in urls:
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = session.get(url, headers=headers, timeout=10)
             st.caption(f"🌐 Fetch `{url}` -> HTTP `{res.status_code}` (`{len(res.content)}` bytes)")
-            if res.status_code == 200 and len(res.content) > 0:
+            
+            # 200 かつ エラーレスポンス HTML（200〜300バイト程度）ではないことを確認
+            if res.status_code == 200 and len(res.content) > 500:
                 return res.content
         except Exception as e:
-            st.warning(f"⚠️️ Fetch Error (`{url}`): {e}")
+            st.warning(f"⚠ Fetch Error (`{url}`): {e}")
             
     return None
 
 
 def parse_binary_actions(data: bytes, stats_by_seat: dict):
-    """
-    Protobuf バイナリから Action/Record タグをスキャンし、各席の数値を集計
-    """
-    # 雀魂のアクション文字列パターン
     patterns = [
         (b"ActionRiichi", "riichi"),
         (b"RecordRiichi", "riichi"),
@@ -89,7 +102,6 @@ def parse_binary_actions(data: bytes, stats_by_seat: dict):
                 break
             
             total_matches += 1
-            # パターン発見位置の後方 80 バイトから seat (0~3) を探査
             window = data[idx : idx + 80]
             seats = extract_varint_seats(window)
             
@@ -110,9 +122,6 @@ def parse_binary_actions(data: bytes, stats_by_seat: dict):
 
 
 def extract_varint_seats(window: bytes) -> list:
-    """
-    バイトウィンドウ内から seat 候補（0~3）を解析
-    """
     seats = []
     pos = 0
     length = len(window)
