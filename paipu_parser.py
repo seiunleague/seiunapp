@@ -1,9 +1,12 @@
 import re
-import requests
 import streamlit as st
+from curl_cffi import requests
 from google.protobuf.internal import decoder
 
 def extract_uuid(paipu_input: str) -> str:
+    """
+    入力文字列から牌譜 UUID（`260926-xxxx-xxxx...`）を抽出する
+    """
     paipu_input = paipu_input.strip()
     match = re.search(r'paipu=([0-9a-zA-Z\-]+)', paipu_input)
     if match:
@@ -37,23 +40,21 @@ def fetch_and_parse(paipu_input: str) -> dict:
         parse_binary_actions(pb_data, stats_by_seat)
         st.success("✅ 牌譜バイナリの解析が完了しました！")
     else:
-        st.error("❌ 牌譜データの取得に失敗しました (403 Forbidden)。")
+        st.error("❌ 牌譜データの取得に失敗しました。UUID またはブロック状況を確認してください。")
 
     return stats_by_seat
 
 
 def fetch_paipu_pb(uuid: str) -> bytes:
     """
-    Cloudflare 403 ブロックを回避するためのブラウザ擬装リクエスト
+    curl_cffi を使用して Chrome 120 の TLS フィンガープリントを完全模倣し Cloudflare を回避
     """
     urls = [
         f"https://mahjongsoul.game.yo-star.com/danten/paipu/{uuid}",
         f"https://game.mahjongsoul.com/danten/paipu/{uuid}"
     ]
     
-    # ブラウザの完全なヘッダー構造を模倣
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
         "Origin": "https://game.mahjongsoul.com",
@@ -61,19 +62,14 @@ def fetch_paipu_pb(uuid: str) -> bytes:
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "cross-site",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"'
     }
-    
-    session = requests.Session()
     
     for url in urls:
         try:
-            res = session.get(url, headers=headers, timeout=10)
+            # impersonate="chrome120" で Chrome の TLS/HTTP2 セッションを完全再現
+            res = requests.get(url, headers=headers, impersonate="chrome120", timeout=15)
             st.caption(f"🌐 Fetch `{url}` -> HTTP `{res.status_code}` (`{len(res.content)}` bytes)")
             
-            # 200 かつ エラーレスポンス HTML（200〜300バイト程度）ではないことを確認
             if res.status_code == 200 and len(res.content) > 500:
                 return res.content
         except Exception as e:
@@ -83,6 +79,9 @@ def fetch_paipu_pb(uuid: str) -> bytes:
 
 
 def parse_binary_actions(data: bytes, stats_by_seat: dict):
+    """
+    Protobuf バイナリ内の Action/Record タグをスキャンして集計
+    """
     patterns = [
         (b"ActionRiichi", "riichi"),
         (b"RecordRiichi", "riichi"),
