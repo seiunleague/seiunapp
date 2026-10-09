@@ -3,10 +3,21 @@ import paipu_parser
 from supabase import create_client
 
 # Supabase 初期化
+
 @st.cache_resource
 def init_supabase():
-    url = st.secrets["supabase"]["SUPABASE_URL"]
-    key = st.secrets["supabase"]["SUPABASE_KEY"]
+    # secrets の階層（[supabase] または直下）のどちらでも対応
+    if "supabase" in st.secrets:
+        url = st.secrets["supabase"].get("SUPABASE_URL") or st.secrets["supabase"].get("url")
+        key = st.secrets["supabase"].get("SUPABASE_KEY") or st.secrets["supabase"].get("key")
+    else:
+        url = st.secrets.get("SUPABASE_URL") or st.secrets.get("url")
+        key = st.secrets.get("SUPABASE_KEY") or st.secrets.get("key")
+
+    if not url or not key:
+        st.error("🚨 Supabase の接続情報（URL / KEY）が Streamlit Secrets から取得できませんでした。")
+        st.stop()
+        
     return create_client(url, key)
 
 supabase = init_supabase()
